@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jarvis</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <main class="assistant-stage">
+      <section id="assistant" aria-label="Jarvis voice assistant">
+        <div id="orb" role="button" tabindex="0" aria-label="Toggle voice listening"></div>
+        <p id="status">Click the orb and speak your request.</p>
+        <div id="log" aria-live="polite" hidden></div>
+      </section>
+    </main>
+    <section id="examples" aria-labelledby="examples-title">
+      <div class="examples-heading">
+        <span class="examples-kicker">YOUR LOCAL ASSISTANT</span>
+        <h2 id="examples-title">Try asking Jarvis</h2>
+      </div>
+      <div class="example-groups">
+        <div class="example-card">
+          <h3>Everyday help</h3>
+          <ul>
+            <li>“What time is it?”</li>
+            <li>“What’s the date?”</li>
+            <li>“What can you do locally?”</li>
+            <li>“What is 12 plus 5?”</li>
+          </ul>
+        </div>
+        <div class="example-card">
+          <h3>Computer and media</h3>
+          <ul>
+            <li>“Open YouTube”</li>
+            <li>“Play [song name]”</li>
+            <li>“Pause” or “Next track”</li>
+            <li>“Turn up the volume” or “Mute”</li>
+            <li>“Put the computer to sleep”</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>
