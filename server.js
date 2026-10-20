@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const fs = require('node:fs');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { execFile, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
 
@@ -9,7 +10,10 @@ const app = express();
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 const PORT = 3000;
 const execFileAsync = promisify(execFile);
+const activeAudioDucks = new Map();
 const deviceActions = Object.freeze({
+  mediaPlay: '[JarvoDeviceActions]::SendMediaKey(179)',
+  mediaPause: '[JarvoDeviceActions]::SendMediaKey(179)',
   mediaPlayPause: '[JarvoDeviceActions]::SendMediaKey(179)',
   mediaNext: '[JarvoDeviceActions]::SendMediaKey(176)',
   mediaPrevious: '[JarvoDeviceActions]::SendMediaKey(177)',
@@ -18,6 +22,106 @@ const deviceActions = Object.freeze({
   volumeMute: '[JarvoDeviceActions]::SendMediaKey(173)',
   sleep: '[JarvoDeviceActions]::Sleep()'
 });
+
+const audioEndpointTypes = `
+using System;
+using System.Runtime.InteropServices;
+
+[ComImport]
+[Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+internal class MMDeviceEnumeratorComObject { }
+
+[ComImport]
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMMDeviceEnumerator
+{
+    [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+    [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+    [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+    [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr callback);
+    [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr callback);
+}
+
+[ComImport]
+[Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMMDevice
+{
+    [PreserveSig] int Activate(ref Guid iid, int classContext, IntPtr activationParams, [MarshalAs(UnmanagedType.Interface)] out IAudioEndpointVolume endpoint);
+    [PreserveSig] int OpenPropertyStore(int access, out IntPtr properties);
+    [PreserveSig] int GetId(out IntPtr id);
+    [PreserveSig] int GetState(out int state);
+}
+
+[ComImport]
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IAudioEndpointVolume
+{
+    [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+    [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+    [PreserveSig] int GetChannelCount(out uint count);
+    [PreserveSig] int SetMasterVolumeLevel(float level, ref Guid eventContext);
+    [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid eventContext);
+    [PreserveSig] int GetMasterVolumeLevel(out float level);
+    [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+    [PreserveSig] int SetChannelVolumeLevel(uint channel, float level, ref Guid eventContext);
+    [PreserveSig] int SetChannelVolumeLevelScalar(uint channel, float level, ref Guid eventContext);
+    [PreserveSig] int GetChannelVolumeLevel(uint channel, out float level);
+    [PreserveSig] int GetChannelVolumeLevelScalar(uint channel, out float level);
+    [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid eventContext);
+    [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+    [PreserveSig] int GetVolumeStepInfo(out uint step, out uint stepCount);
+    [PreserveSig] int VolumeStepUp(ref Guid eventContext);
+    [PreserveSig] int VolumeStepDown(ref Guid eventContext);
+    [PreserveSig] int QueryHardwareSupport(out uint hardwareSupportMask);
+    [PreserveSig] int GetVolumeRange(out float min, out float max, out float increment);
+}
+
+public static class JarvoAudioEndpoint
+{
+    private static IAudioEndpointVolume GetEndpoint()
+    {
+        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+        IMMDevice device;
+        Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(0, 1, out device));
+        var iid = typeof(IAudioEndpointVolume).GUID;
+        IAudioEndpointVolume endpoint;
+        Marshal.ThrowExceptionForHR(device.Activate(ref iid, 23, IntPtr.Zero, out endpoint));
+        return endpoint;
+    }
+
+    public static float GetVolume()
+    {
+        float level;
+        Marshal.ThrowExceptionForHR(GetEndpoint().GetMasterVolumeLevelScalar(out level));
+        return level;
+    }
+
+    public static void SetVolume(float level)
+    {
+        if (level < 0f || level > 1f) throw new ArgumentOutOfRangeException("level");
+        var eventContext = Guid.Empty;
+        Marshal.ThrowExceptionForHR(GetEndpoint().SetMasterVolumeLevelScalar(level, ref eventContext));
+    }
+}
+`;
+
+async function runAudioEndpointScript(command) {
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+${audioEndpointTypes}
+'@
+${command}
+`;
+  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true,
+    timeout: 10000
+  });
+  return stdout.trim();
+}
 
 function findChromePath() {
   const chromePaths = [
@@ -149,6 +253,51 @@ app.post('/device-action', async (req, res) => {
     } catch (err) {
       console.error('Could not open YouTube in Chrome:', err);
       return res.status(err.status || 500).json({ reply: err.message || 'Could not launch Chrome. Check the server terminal for details.' });
+    }
+  }
+
+  if (action === 'audioDuck') {
+    try {
+      const existing = activeAudioDucks.entries().next().value;
+      if (existing) return res.json({ token: existing[0], reply: 'System volume is already lowered.' });
+
+      const originalVolume = Number(await runAudioEndpointScript('[JarvoAudioEndpoint]::GetVolume()'));
+      if (!Number.isFinite(originalVolume) || originalVolume < 0 || originalVolume > 1) {
+        throw new Error('Windows returned an invalid master volume level.');
+      }
+      const loweredVolume = originalVolume * 0.5;
+      await runAudioEndpointScript(`[JarvoAudioEndpoint]::SetVolume([single]${loweredVolume.toFixed(6)})`);
+      const token = randomUUID();
+      activeAudioDucks.set(token, { originalVolume, loweredVolume });
+      return res.json({ token, reply: 'System volume lowered temporarily.' });
+    } catch (err) {
+      console.error('Could not temporarily lower system volume:', err);
+      return res.status(500).json({ reply: 'Could not lower system volume for listening.' });
+    }
+  }
+
+  if (action === 'audioRestore') {
+    const token = typeof req.body.token === 'string' ? req.body.token : '';
+    const duckedVolume = activeAudioDucks.get(token);
+    if (!duckedVolume) {
+      return res.status(404).json({ reply: 'There is no matching temporary volume change to restore.' });
+    }
+
+    try {
+      const currentVolume = Number(await runAudioEndpointScript('[JarvoAudioEndpoint]::GetVolume()'));
+      const unchanged = Math.abs(currentVolume - duckedVolume.loweredVolume) < 0.005;
+      if (unchanged) {
+        await runAudioEndpointScript(`[JarvoAudioEndpoint]::SetVolume([single]${duckedVolume.originalVolume.toFixed(6)})`);
+      }
+      activeAudioDucks.delete(token);
+      return res.json({
+        reply: unchanged
+          ? 'Restored the original system volume.'
+          : 'The system volume was changed manually, so it was left as-is.'
+      });
+    } catch (err) {
+      console.error('Could not restore system volume:', err);
+      return res.status(500).json({ reply: 'Could not restore the original system volume.' });
     }
   }
 

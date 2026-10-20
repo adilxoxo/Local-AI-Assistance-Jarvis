@@ -5,9 +5,11 @@ const status = document.getElementById('status');
 const examples = document.getElementById('examples');
 const appShell = document.querySelector('.app-shell');
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const AWAKE_TIMEOUT_MS = 15000;
+const LISTENING_IDLE_TIMEOUT_MS = 30000;
 const recognition = SpeechRecognition ? new SpeechRecognition() : null;
 if (recognition) {
-  recognition.continuous = true;
+  recognition.continuous = false;
   recognition.interimResults = false;
   recognition.lang = 'en-US';
 } else {
@@ -15,28 +17,32 @@ if (recognition) {
 }
 
 let listening = false;
+let recognitionStarting = false;
 let voiceEnabled = false;
+let awake = false;
 let voicePaused = false;
-let restartOnEnd = false;
 let processingCommand = false;
 let speaking = false;
+let recognitionRestartTimer = 0;
+let awakeTimer = 0;
+let listeningIdleTimer = 0;
+let audioDuckToken = '';
+let audioDuckPromise = null;
+let audioRestorePromise = null;
 
 orb.addEventListener('click', () => {
   if (!recognition) return;
 
   if (!voiceEnabled) {
-    voiceEnabled = true;
-    examples.hidden = true;
-    appShell.classList.add('assistant-active');
+    setVoiceEnabled(true);
+    startRecognition();
+  } else if (voicePaused) {
+    voicePaused = false;
+    setAwake(false);
+    status.textContent = 'Listening for “Hey Jarvis.”';
     startRecognition();
   } else {
-    voiceEnabled = false;
-    voicePaused = false;
-    restartOnEnd = false;
-    if (listening) recognition.stop();
-    log.hidden = true;
-    examples.hidden = false;
-    appShell.classList.remove('assistant-active');
+    setVoiceEnabled(false);
     status.textContent = 'Voice listening is off.';
   }
 });
@@ -50,34 +56,56 @@ orb.addEventListener('keydown', (event) => {
 
 if (recognition) {
   recognition.onstart = () => {
+    recognitionStarting = false;
     listening = true;
+    if (!voiceEnabled || voicePaused) {
+      recognition.stop();
+      return;
+    }
     log.hidden = false;
     orb.classList.add('listening');
-    status.textContent = 'Listening... Speak your request.';
+    status.textContent = awake
+      ? 'Jarvis is awake for 15 seconds. Listening stops after 30 seconds without a command.'
+      : 'Say “Hey Jarvis” to wake Jarvis. Listening stops after 30 seconds without a command.';
   };
 
   recognition.onend = () => {
+    recognitionStarting = false;
     listening = false;
     orb.classList.remove('listening');
-    if (restartOnEnd && voiceEnabled && !voicePaused) {
-      restartOnEnd = false;
-      startRecognition();
-    } else if (!voicePaused && voiceEnabled) {
-      voiceEnabled = false;
-      log.hidden = true;
-      examples.hidden = false;
-      appShell.classList.remove('assistant-active');
-      status.textContent = 'Voice recognition stopped. Click the orb to try again.';
+    if (voiceEnabled && !voicePaused) {
+      window.clearTimeout(recognitionRestartTimer);
+      recognitionRestartTimer = window.setTimeout(startRecognition, 250);
     }
   };
 
   recognition.onresult = (event) => {
     if (voicePaused || processingCommand || speaking) return;
 
-    const transcript = event.results[event.results.length - 1][0].transcript.trim();
+    const result = event.results[event.results.length - 1];
+    if (!result.isFinal) return;
+    const transcript = result[0].transcript.trim();
     if (!transcript) return;
+    const wakePhrase = /^hey\s+jarvis\b[\s,]*/i;
+    const wakeMatch = transcript.match(wakePhrase);
+    if (!awake && !wakeMatch) return;
+    if (wakeMatch) lowerSystemVolumeForWake();
+
+    const command = transcript.replace(wakePhrase, '')
+      .replace(/^[.!?\s,]+|[.!?\s,]+$/g, '')
+      .trim();
+    if (!command) {
+      if (!awake) {
+        setAwake(true);
+        status.textContent = 'Jarvis is awake. Speak a command within 15 seconds.';
+      }
+      return;
+    }
+
+    window.clearTimeout(listeningIdleTimer);
+    setAwake(true, false);
     addLine('You: ' + transcript);
-    handleCommand(transcript);
+    handleCommand(command);
   };
 
   recognition.onerror = (event) => {
@@ -86,23 +114,109 @@ if (recognition) {
       : `Voice recognition error: ${event.error}.`;
     console.error('Speech recognition error:', event.error);
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-      voiceEnabled = false;
-      log.hidden = true;
-      examples.hidden = false;
-      appShell.classList.remove('assistant-active');
+      setVoiceEnabled(false);
     }
   };
 }
 
+function setVoiceEnabled(enabled) {
+  voiceEnabled = enabled;
+  if (!enabled) {
+    window.clearTimeout(recognitionRestartTimer);
+    window.clearTimeout(awakeTimer);
+    window.clearTimeout(listeningIdleTimer);
+    awake = false;
+    restoreSystemVolume();
+    if (listening) recognition.stop();
+  } else {
+    resetListeningIdleTimeout();
+  }
+  orb.setAttribute('aria-pressed', String(enabled));
+  examples.hidden = enabled;
+  appShell.classList.toggle('assistant-active', enabled);
+  if (!enabled) log.hidden = true;
+}
+
+function resetListeningIdleTimeout() {
+  window.clearTimeout(listeningIdleTimer);
+  if (!voiceEnabled) return;
+  listeningIdleTimer = window.setTimeout(() => {
+    setVoiceEnabled(false);
+    status.textContent = 'Listening stopped after 30 seconds without a command. Click the orb to start listening again.';
+  }, LISTENING_IDLE_TIMEOUT_MS);
+}
+
+function setAwake(enabled, startTimer = true) {
+  awake = enabled;
+  window.clearTimeout(awakeTimer);
+  if (awake && startTimer && voiceEnabled) {
+    awakeTimer = window.setTimeout(() => {
+      awake = false;
+      status.textContent = 'Listening for “Hey Jarvis.” Say the wake phrase to give another command.';
+      restoreSystemVolume();
+    }, AWAKE_TIMEOUT_MS);
+  }
+}
+
+function lowerSystemVolumeForWake() {
+  if (audioDuckToken || audioDuckPromise) return audioDuckPromise;
+  audioDuckPromise = (async () => {
+    try {
+      const response = await fetch('/device-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'audioDuck' })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.reply || `Request failed (${response.status}).`);
+      if (typeof data.token !== 'string' || !data.token) {
+        throw new Error('The server did not return a volume restore token.');
+      }
+      audioDuckToken = data.token;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error.';
+      status.textContent = `Could not lower system volume: ${message}`;
+      console.error('Could not temporarily lower system volume:', error);
+    } finally {
+      audioDuckPromise = null;
+    }
+  })();
+  return audioDuckPromise;
+}
+
+async function restoreSystemVolume() {
+  if (audioRestorePromise) return audioRestorePromise;
+  audioRestorePromise = (async () => {
+    if (audioDuckPromise) await audioDuckPromise;
+    if (!audioDuckToken) return;
+
+    try {
+      const response = await fetch('/device-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'audioRestore', token: audioDuckToken })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.reply || `Request failed (${response.status}).`);
+      audioDuckToken = '';
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error.';
+      status.textContent = `Could not restore system volume: ${message}`;
+      console.error('Could not restore system volume:', error);
+    }
+  })();
+  await audioRestorePromise;
+  audioRestorePromise = null;
+}
+
 function startRecognition() {
-  if (!recognition || !voiceEnabled || voicePaused || listening) return;
+  if (!recognition || !voiceEnabled || voicePaused || listening || recognitionStarting) return;
   try {
+    recognitionStarting = true;
     recognition.start();
   } catch (error) {
-    voiceEnabled = false;
-    log.hidden = true;
-    examples.hidden = false;
-    appShell.classList.remove('assistant-active');
+    recognitionStarting = false;
+    setVoiceEnabled(false);
     status.textContent = 'Could not start voice recognition. Check microphone permissions and try again.';
     console.error('Could not start speech recognition:', error);
   }
@@ -118,7 +232,6 @@ function resumeRecognition() {
   if (!recognition || !voiceEnabled) return;
   voicePaused = false;
   if (listening) {
-    restartOnEnd = true;
     recognition.stop();
   } else {
     startRecognition();
@@ -132,7 +245,7 @@ async function handleCommand(command) {
 
   const cleanedCommand = command.trim()
     .replace(/[.!?]+$/, '')
-    .replace(/^(?:(?:hey|okay|ok)\s+)?jarvis[,\s]+/i, '')
+    .replace(/^hey\s+jarvis\b[\s,]*/i, '')
     .replace(/^(?:can you|could you|would you|please)\s+/i, '')
     .replace(/\s+please$/i, '')
     .trim();
@@ -143,7 +256,7 @@ async function handleCommand(command) {
       '• Do simple arithmetic',
       '• Open websites',
       '• Search YouTube for a song and open it in Chrome',
-      '• Play/pause media and skip to the next or previous track',
+      '• Play or pause music in Chrome and control other media playback',
       '• Turn volume up or down, mute, or unmute',
       '• Put this PC to sleep',
       '• Answer general questions using the configured AI service'
@@ -196,9 +309,19 @@ async function handleCommand(command) {
 
   const deviceCommands = [
     {
+      action: 'mediaPlay',
+      label: 'play Chrome music',
+      pattern: /^(?:play|resume)(?:\s+(?:(?:the\s+)?(?:chrome\s+)?(?:music|media|audio|playback)|(?:the\s+)?music\s+(?:in|on)\s+chrome))$/
+    },
+    {
+      action: 'mediaPause',
+      label: 'pause Chrome music',
+      pattern: /^(?:pause|stop)(?:\s+(?:(?:the\s+)?(?:chrome\s+)?(?:music|media|audio|playback)|(?:the\s+)?music\s+(?:in|on)\s+chrome))$/
+    },
+    {
       action: 'mediaPlayPause',
       label: 'send the media play/pause key',
-      pattern: /^(?:toggle|play|pause|resume|play pause|play and pause|play\/pause|toggle playback)(?:\s+(?:the\s+)?(?:music|media|playback))?$/
+      pattern: /^(?:toggle|play pause|play and pause|play\/pause|toggle playback)(?:\s+(?:the\s+)?(?:music|media|playback))?$/
     },
     {
       action: 'mediaNext',
@@ -251,8 +374,8 @@ async function handleCommand(command) {
     return;
   }
 
-  if (command.startsWith('open ')) {
-    const site = command.replace('open ', '').trim();
+  if (cleanedCommand.toLowerCase().startsWith('open ')) {
+    const site = cleanedCommand.slice('open '.length).trim();
     window.open(`https://${site}.com`, '_blank');
     speak(`Opening ${site}`);
     status.textContent = 'Ready.';
@@ -264,7 +387,7 @@ async function handleCommand(command) {
     const res = await fetch('/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: command })
+      body: JSON.stringify({ message: cleanedCommand })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.reply || `Request failed (${res.status}).`);
@@ -301,8 +424,9 @@ async function findAndPlayYoutubeSong(song) {
     if (!playResponse.ok) throw new Error(result.reply || `Could not open video (${playResponse.status}).`);
     const title = match.channel ? `"${match.title}" by ${match.channel}` : `"${match.title}"`;
     addLine(`Jarvis: Playing ${title} on YouTube.`);
-    status.textContent = `Playing ${title} on YouTube.`;
-    speak(`Playing ${match.title}.`);
+    setAwake(false);
+    await finishCommand();
+    status.textContent = `Playing ${title} on YouTube. Listening for “Hey Jarvis.”`;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error.';
     status.textContent = `Could not play the song: ${message}`;
@@ -323,6 +447,8 @@ async function runDeviceAction(action, description, details = {}) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.reply || `Request failed (${res.status}).`);
     const mediaResponses = {
+      mediaPlay: 'Toggled playback in the active media player.',
+      mediaPause: 'Toggled playback in the active media player.',
       mediaPlayPause: 'Toggled media playback.',
       mediaNext: 'Skipped to the next track.',
       mediaPrevious: 'Returned to the previous track.',
@@ -333,7 +459,11 @@ async function runDeviceAction(action, description, details = {}) {
     const reply = mediaResponses[action] || data.reply;
     addLine('Jarvis: ' + reply);
     status.textContent = reply;
-    if (action.startsWith('media') || action.startsWith('volume')) {
+    if (['mediaPlay', 'mediaPause', 'mediaPlayPause'].includes(action)) {
+      setAwake(false);
+      status.textContent = `${reply} Listening for “Hey Jarvis.”`;
+      await finishCommand();
+    } else if (action.startsWith('media') || action.startsWith('volume')) {
       finishCommand();
     } else {
       speak(reply);
@@ -366,11 +496,15 @@ function speak(text) {
   utterance.onend = onSpeechFinished;
   utterance.onerror = onSpeechFinished;
   synth.cancel();
+  speaking = true;
   synth.speak(utterance);
 }
 
-function finishCommand() {
+async function finishCommand() {
   processingCommand = false;
+  if (awake) setAwake(true);
+  await restoreSystemVolume();
+  resetListeningIdleTimeout();
   resumeRecognition();
 }
 
@@ -381,4 +515,10 @@ function addLine(text) {
   message.textContent = text.replace(/^(?:You|Jarvis):\s*/, '');
   log.append(message);
   log.scrollTo({ top: log.scrollHeight, behavior: 'smooth' });
+}
+
+if (recognition) {
+  setVoiceEnabled(true);
+  status.textContent = 'Starting wake listening... Allow microphone access, then say “Hey Jarvis.”';
+  startRecognition();
 }
